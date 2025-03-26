@@ -59,6 +59,7 @@ var (
 	lyrics_only    bool
 	atmos_only     bool
 	skip_mv        bool
+	cover_art_only bool // New flag for downloading only cover art
 	alac_max       *int
 	atmos_max      *int
 	mv_max         *int
@@ -411,52 +412,149 @@ func getMeta(albumId string, token string, storefront string) (*structs.AutoGene
 }
 
 func writeCover(sanAlbumFolder, name string, url string) (string, error) {
+	// Validate inputs
+	if sanAlbumFolder == "" {
+		return "", errors.New("Error: Empty album folder path provided")
+	}
+	if name == "" {
+		return "", errors.New("Error: Empty cover name provided")
+	}
+	if url == "" {
+		return "", errors.New("Error: Empty cover URL provided")
+	}
+
+	// Format URL and determine output path
 	covPath := filepath.Join(sanAlbumFolder, name+"."+Config.CoverFormat)
+	originalUrl := url
+
 	if Config.CoverFormat == "original" {
-		ext := strings.Split(url, "/")[len(strings.Split(url, "/"))-2]
-		ext = ext[strings.LastIndex(ext, ".")+1:]
+		// Extract extension from URL
+		urlParts := strings.Split(url, "/")
+		if len(urlParts) < 3 {
+			return "", fmt.Errorf("Invalid URL format: %s", url)
+		}
+
+		extPart := urlParts[len(urlParts)-2]
+		extIndex := strings.LastIndex(extPart, ".")
+		if extIndex < 0 {
+			return "", fmt.Errorf("Could not determine extension from URL: %s", url)
+		}
+
+		ext := extPart[extIndex+1:]
+		if ext == "" {
+			ext = "jpg" // Default to jpg if extraction fails
+			fmt.Printf("Warning: Could not extract extension from URL %s, defaulting to jpg\n", url)
+		}
 		covPath = filepath.Join(sanAlbumFolder, name+"."+ext)
 	}
+
+	// Check if cover already exists
 	exists, err := fileExists(covPath)
 	if err != nil {
-		fmt.Println("Failed to check if cover exists.")
-		return "", err
+		return "", fmt.Errorf("Failed to check if cover exists at %s: %w", covPath, err)
 	}
+
+	// Remove existing file if it exists
 	if exists {
-		_ = os.Remove(covPath)
+		err = os.Remove(covPath)
+		if err != nil {
+			return "", fmt.Errorf("Failed to remove existing cover at %s: %w", covPath, err)
+		}
 	}
+
+	// Process URL based on format requirements
 	if Config.CoverFormat == "png" {
 		re := regexp.MustCompile(`\{w\}x\{h\}`)
+		if !re.MatchString(url) {
+			return "", fmt.Errorf("URL does not contain {w}x{h} placeholder: %s", url)
+		}
+
 		parts := re.Split(url, 2)
+		if len(parts) != 2 {
+			return "", fmt.Errorf("Failed to split URL on {w}x{h}: %s", url)
+		}
+
 		url = parts[0] + "{w}x{h}" + strings.Replace(parts[1], ".jpg", ".png", 1)
 	}
+
+	// Replace dimensions in URL
 	url = strings.Replace(url, "{w}x{h}", Config.CoverSize, 1)
+
+	// Special handling for original format
 	if Config.CoverFormat == "original" {
 		url = strings.Replace(url, "is1-ssl.mzstatic.com/image/thumb", "a5.mzstatic.com/us/r1000/0", 1)
-		url = url[:strings.LastIndex(url, "/")]
+		lastSlashIndex := strings.LastIndex(url, "/")
+		if lastSlashIndex < 0 {
+			return "", fmt.Errorf("Invalid URL format for original cover: %s", url)
+		}
+		url = url[:lastSlashIndex]
 	}
+
+	fmt.Printf("Processing cover: %s -> %s\n", name, covPath)
+	fmt.Printf("Cover URL: %s\n", url)
+
+	// Create HTTP request
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("Failed to create HTTP request for URL %s: %w", url, err)
 	}
+
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+	// Execute request
 	do, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		// Try with original URL as fallback
+		if url != originalUrl {
+			fmt.Printf("Failed with processed URL, trying original URL: %s\n", originalUrl)
+			req, err = http.NewRequest("GET", originalUrl, nil)
+			if err != nil {
+				return "", fmt.Errorf("Failed to create HTTP request for fallback URL: %w", err)
+			}
+
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+			do, err = http.DefaultClient.Do(req)
+			if err != nil {
+				return "", fmt.Errorf("Network error downloading cover from both URLs: %w", err)
+			}
+		} else {
+			return "", fmt.Errorf("Network error downloading cover: %w", err)
+		}
 	}
+
 	defer do.Body.Close()
+
+	// Check HTTP status
 	if do.StatusCode != http.StatusOK {
-		return "", errors.New(do.Status)
+		return "", fmt.Errorf("Server returned non-OK status downloading cover: %s (HTTP %d)", do.Status, do.StatusCode)
 	}
+
+	// Check content length
+	contentLength := do.ContentLength
+	if contentLength <= 0 {
+		fmt.Println("Warning: Content length not available or zero, proceeding anyway")
+	} else if contentLength < 1000 {
+		fmt.Printf("Warning: Cover image is very small (%d bytes), might be a placeholder\n", contentLength)
+	}
+
+	// Create destination file
 	f, err := os.Create(covPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("Failed to create cover file at %s: %w", covPath, err)
 	}
 	defer f.Close()
-	_, err = io.Copy(f, do.Body)
+
+	// Copy content
+	bytesWritten, err := io.Copy(f, do.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("Failed to write cover data to file: %w", err)
 	}
+
+	if bytesWritten == 0 {
+		return "", errors.New("Cover downloaded but file is empty (0 bytes)")
+	}
+
+	fmt.Printf("Cover downloaded successfully: %s (%d bytes)\n", covPath, bytesWritten)
 	return covPath, nil
 }
 
@@ -572,6 +670,13 @@ func checkTrackHasAtmos(masterUrl string) (bool, error) {
 func downloadTrack(trackNum int, trackTotal int, meta *structs.AutoGenerated, track structs.TrackData, albumId, token, storefront, mediaUserToken, sanAlbumFolder, Codec string, covPath string) {
 	counter.Total++
 	fmt.Printf("Track %d of %d:\n", trackNum, trackTotal)
+
+	// Skip if cover_art_only mode is enabled
+	if cover_art_only {
+		// We already downloaded the album cover in rip(), no need to do anything per track
+		counter.Success++
+		return
+	}
 
 	//mv dl dev
 	if track.Type == "music-videos" {
@@ -840,6 +945,96 @@ func rip(albumId string, token string, storefront string, mediaUserToken string,
 	meta, err := getMeta(albumId, token, storefront)
 	if err != nil {
 		return err
+	}
+
+	// If cover_art_only flag is set, only download cover art
+	if cover_art_only {
+		fmt.Println("Cover art only mode enabled: Will only download album artwork")
+
+		// Use the same folder structure logic as regular downloads
+		var singerFoldername string
+		if Config.ArtistFolderFormat != "" {
+			if strings.Contains(albumId, "pl.") {
+				singerFoldername = strings.NewReplacer(
+					"{ArtistName}", "Apple Music",
+					"{ArtistId}", "",
+					"{UrlArtistName}", "Apple Music",
+				).Replace(Config.ArtistFolderFormat)
+			} else if len(meta.Data[0].Relationships.Artists.Data) > 0 {
+				singerFoldername = strings.NewReplacer(
+					"{UrlArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
+					"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
+					"{ArtistId}", meta.Data[0].Relationships.Artists.Data[0].ID,
+				).Replace(Config.ArtistFolderFormat)
+			} else {
+				singerFoldername = strings.NewReplacer(
+					"{UrlArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
+					"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
+					"{ArtistId}", "",
+				).Replace(Config.ArtistFolderFormat)
+			}
+			if strings.HasSuffix(singerFoldername, ".") {
+				singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
+			}
+			singerFoldername = strings.TrimSpace(singerFoldername)
+			if len(singerFoldername) > maxNameLength {
+				if len(meta.Data[0].Relationships.Artists.Data) > 0 && !strings.Contains(albumId, "pl.") {
+					singerFoldername = meta.Data[0].Relationships.Artists.Data[0].ID
+				} else {
+					singerFoldername = "UnknownArtist"
+				}
+			}
+			fmt.Println(singerFoldername)
+		}
+
+		singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
+
+		var albumFolder string
+		if strings.Contains(albumId, "pl.") {
+			albumFolder = strings.NewReplacer(
+				"{ArtistName}", "Apple Music",
+				"{PlaylistName}", LimitString(meta.Data[0].Attributes.Name),
+				"{PlaylistId}", albumId,
+				"{Quality}", "",
+				"{Codec}", "ALAC",
+				"{Tag}", "",
+			).Replace(Config.PlaylistFolderFormat)
+		} else {
+			albumFolder = strings.NewReplacer(
+				"{ReleaseDate}", meta.Data[0].Attributes.ReleaseDate,
+				"{ReleaseYear}", meta.Data[0].Attributes.ReleaseDate[:4],
+				"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
+				"{AlbumName}", LimitString(meta.Data[0].Attributes.Name),
+				"{UPC}", meta.Data[0].Attributes.Upc,
+				"{RecordLabel}", meta.Data[0].Attributes.RecordLabel,
+				"{Copyright}", meta.Data[0].Attributes.Copyright,
+				"{AlbumId}", albumId,
+				"{Quality}", "",
+				"{Codec}", "ALAC",
+				"{Tag}", "",
+			).Replace(Config.AlbumFolderFormat)
+		}
+
+		albumFolder = strings.TrimSpace(albumFolder)
+		sanAlbumFolder := filepath.Join(singerFolder, forbiddenNames.ReplaceAllString(albumFolder, "_"))
+
+		// Create album folder
+		err = os.MkdirAll(sanAlbumFolder, 0755)
+		if err != nil {
+			return errors.New("Failed to create album folder.\n" + err.Error())
+		}
+
+		// Download cover
+		fmt.Println("Downloading album artwork...")
+		coverURL := meta.Data[0].Attributes.Artwork.URL
+		_, err = writeCover(sanAlbumFolder, "cover", coverURL)
+		if err != nil {
+			return errors.New("Failed to download cover.\n" + err.Error())
+		}
+
+		fmt.Println("Cover artwork successfully downloaded!")
+		counter.Success++
+		return nil
 	}
 
 	// If atmos-only flag is set, check if album has Atmos tracks
@@ -1391,6 +1586,7 @@ func main() {
 	pflag.BoolVar(&lyrics_only, "lyrics-only", false, "Download only lyrics, skip audio/video")
 	pflag.BoolVar(&atmos_only, "atmos-only", false, "Download only albums with Atmos tracks, skip others")
 	pflag.BoolVar(&skip_mv, "skip-mv", false, "Skip all music video downloads")
+	pflag.BoolVar(&cover_art_only, "cover-art", false, "Download only cover art")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
 	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")
 	aac_type = pflag.String("aac-type", Config.AacType, "Select AAC type, aac aac-binaural aac-downmix")
@@ -1431,7 +1627,57 @@ func main() {
 		return
 	}
 	os.Args = args
-	if strings.Contains(os.Args[0], "/artist/") {
+
+	// Handle artist URL with cover-art-only mode
+	if strings.Contains(os.Args[0], "/artist/") && cover_art_only {
+		fmt.Println("Artist cover art download mode enabled")
+		fmt.Printf("Processing artist URL: %s\n", os.Args[0])
+
+		// Download artist cover first
+		err := downloadArtistCover(os.Args[0], token)
+		if err != nil {
+			fmt.Printf("⚠️ Failed to download artist cover image: %v\n", err)
+			fmt.Println("Will continue with album covers...")
+		} else {
+			fmt.Println("✓ Artist cover image downloaded successfully")
+		}
+
+		// Continue with album covers
+		fmt.Println("Retrieving artist information...")
+		urlArtistName, urlArtistID, err := getUrlArtistName(os.Args[0], token)
+		if err != nil {
+			fmt.Printf("❌ Error: Failed to get artist information: %v\n", err)
+			fmt.Println("Cannot continue without artist information.")
+			return
+		}
+		fmt.Printf("Found artist: %s (ID: %s)\n", urlArtistName, urlArtistID)
+
+		Config.ArtistFolderFormat = strings.NewReplacer(
+			"{UrlArtistName}", LimitString(urlArtistName),
+			"{ArtistId}", urlArtistID,
+		).Replace(Config.ArtistFolderFormat)
+
+		fmt.Println("Retrieving artist albums...")
+		albumArgs, err := checkArtist(os.Args[0], token, "albums")
+		if err != nil {
+			fmt.Printf("❌ Error: Failed to get artist albums: %v\n", err)
+			fmt.Println("Cannot continue without album information.")
+			return
+		}
+
+		if len(albumArgs) == 0 {
+			fmt.Println("⚠️ Warning: No albums found for this artist")
+			fmt.Println("Nothing to download.")
+			return
+		}
+
+		fmt.Printf("Found %d albums\n", len(albumArgs))
+
+		// Skip MV if we're only downloading cover art
+		os.Args = albumArgs
+		fmt.Println("Proceeding to download album covers...")
+	} else if strings.Contains(os.Args[0], "/artist/") {
+		// Original artist URL handling code
 		urlArtistName, urlArtistID, err := getUrlArtistName(os.Args[0], token)
 		if err != nil {
 			fmt.Println("Failed to get artistname.")
@@ -1550,6 +1796,12 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 	// Skip if skip_mv flag is enabled
 	if skip_mv {
 		fmt.Println("Skipping MV download (skip-mv enabled)")
+		return nil
+	}
+
+	// Skip MV download in cover-art-only mode
+	if cover_art_only {
+		fmt.Println("Skipping MV download (cover-art-only mode)")
 		return nil
 	}
 
@@ -2246,4 +2498,108 @@ func getToken() (string, error) {
 	token := regex.FindString(string(body))
 
 	return token, nil
+}
+
+// New function to download artist cover image
+func downloadArtistCover(artistUrl string, token string) error {
+	storefront, artistId := checkUrlArtist(artistUrl)
+	if artistId == "" {
+		return errors.New("Invalid artist URL: Could not extract artist ID from the URL")
+	}
+	if storefront == "" {
+		return errors.New("Invalid artist URL: Could not extract storefront from the URL")
+	}
+
+	fmt.Printf("Attempting to download cover for artist ID: %s from storefront: %s\n", artistId, storefront)
+
+	// Get artist information
+	apiUrl := fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/artists/%s", storefront, artistId)
+	req, err := http.NewRequest("GET", apiUrl, nil)
+	if err != nil {
+		return fmt.Errorf("Error creating API request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	req.Header.Set("Origin", "https://music.apple.com")
+
+	// Set query parameters
+	query := url.Values{}
+	query.Set("l", Config.Language)
+	query.Set("fields[artists]", "name,artwork")
+	req.URL.RawQuery = query.Encode()
+
+	// Make the request
+	fmt.Println("Making API request to fetch artist data...")
+	do, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("Network error while fetching artist data: %w", err)
+	}
+	defer do.Body.Close()
+
+	// Check HTTP status
+	if do.StatusCode != http.StatusOK {
+		return fmt.Errorf("API returned non-200 status: %s (HTTP %d)", do.Status, do.StatusCode)
+	}
+
+	// Decode response
+	obj := new(structs.AutoGeneratedArtist)
+	err = json.NewDecoder(do.Body).Decode(&obj)
+	if err != nil {
+		return fmt.Errorf("Error parsing artist data from API: %w", err)
+	}
+
+	// Check if we got data
+	if len(obj.Data) == 0 {
+		return errors.New("API returned empty data array: No artist data found")
+	}
+
+	// Check if artist attributes exist
+	if obj.Data[0].Attributes.Name == "" {
+		return errors.New("Artist name not found in API response")
+	}
+
+	// Check if artwork exists
+	if obj.Data[0].Attributes.Artwork.URL == "" {
+		return errors.New("Artist has no artwork URL in API response")
+	}
+
+	// Create artist folder
+	artistName := obj.Data[0].Attributes.Name
+	fmt.Printf("Found artist: %s (ID: %s)\n", artistName, obj.Data[0].ID)
+
+	singerFoldername := strings.NewReplacer(
+		"{UrlArtistName}", LimitString(artistName),
+		"{ArtistName}", LimitString(artistName),
+		"{ArtistId}", obj.Data[0].ID,
+	).Replace(Config.ArtistFolderFormat)
+
+	if strings.HasSuffix(singerFoldername, ".") {
+		singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
+	}
+	singerFoldername = strings.TrimSpace(singerFoldername)
+	if len(singerFoldername) > maxNameLength {
+		singerFoldername = obj.Data[0].ID
+		fmt.Printf("Artist folder name exceeded max length, using ID instead: %s\n", singerFoldername)
+	}
+
+	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
+	err = os.MkdirAll(singerFolder, os.ModePerm)
+	if err != nil {
+		return fmt.Errorf("Failed to create artist folder: %w", err)
+	}
+
+	// Download artist cover
+	fmt.Printf("Downloading artist cover image from URL: %s\n", obj.Data[0].Attributes.Artwork.URL)
+	artworkURL := obj.Data[0].Attributes.Artwork.URL
+	_, err = writeCover(singerFolder, "folder", artworkURL)
+	if err != nil {
+		return fmt.Errorf("Failed to download artist cover: %w", err)
+	}
+
+	fmt.Println("Artist cover image successfully downloaded!")
+	counter.Success++
+
+	return nil
 }
